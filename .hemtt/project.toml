@@ -1,0 +1,19 @@
+name = "SPECTRE"
+prefix = "spectre"
+mainprefix = "z"
+
+hemtt = "1.12"
+
+[files]
+include = [
+    "mod.cpp",
+]
+exclude = [
+    "*.psd",
+    "*.bak",
+    "*.tmp",
+]
+
+[signing]
+authority = "spectre_release"
+version = 3

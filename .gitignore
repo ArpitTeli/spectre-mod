@@ -1,0 +1,9 @@
+node_modules/
+build/
+dist/
+*.pbo
+*.bisign
+*.bikey
+*.biprivatekey
+.DS_Store
+Thumbs.db
