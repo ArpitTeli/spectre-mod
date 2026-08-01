@@ -651,25 +651,26 @@ SPECTRE_fnc_detectEvents = {
     // Also detect newly spotted enemy vehicles
     {
         private _enemy    = _x;
-        if (isNull _enemy) continue;
-        private _enemyKey = str _enemy;
+        if (!isNull _enemy) then {
+            private _enemyKey = str _enemy;
 
-        if (!(_enemyKey in SPECTRE_spottedEnemies)) then {
-            private _spotters = SPECTRE_blufor select { _x knowsAbout _enemy > 0.3 };
-            if (count _spotters > 0) then {
-                SPECTRE_spottedEnemies pushBack _enemyKey;
-                if (count SPECTRE_spottedEnemies > 200) then {
-                    SPECTRE_spottedEnemies = SPECTRE_spottedEnemies select [100, (count SPECTRE_spottedEnemies) - 100];
+            if (!(_enemyKey in SPECTRE_spottedEnemies)) then {
+                private _spotters = SPECTRE_blufor select { _x knowsAbout _enemy > 0.3 };
+                if (count _spotters > 0) then {
+                    SPECTRE_spottedEnemies pushBack _enemyKey;
+                    if (count SPECTRE_spottedEnemies > 200) then {
+                        SPECTRE_spottedEnemies = SPECTRE_spottedEnemies select [100, (count SPECTRE_spottedEnemies) - 100];
+                    };
+                    private _su        = _spotters select 0;
+                    private _spotterCs = _su getVariable ["SPECTRE_callsign", vehicleVarName _su];
+                    _evts pushBack format [
+                        "{""type"":""CONTACT_SPOTTED"",""unit"":""%1"",""contact_type"":""%2"",""id"":""CS_%3_%4""}",
+                        _spotterCs,
+                        [_enemy] call SPECTRE_fnc_vehicleType,
+                        SPECTRE_blufor find _su,
+                        round time
+                    ];
                 };
-                private _su        = _spotters select 0;
-                private _spotterCs = _su getVariable ["SPECTRE_callsign", vehicleVarName _su];
-                _evts pushBack format [
-                    "{""type"":""CONTACT_SPOTTED"",""unit"":""%1"",""contact_type"":""%2"",""id"":""CS_%3_%4""}",
-                    _spotterCs,
-                    [_enemy] call SPECTRE_fnc_vehicleType,
-                    SPECTRE_blufor find _su,
-                    round time
-                ];
             };
         };
     } forEach (vehicles select {
