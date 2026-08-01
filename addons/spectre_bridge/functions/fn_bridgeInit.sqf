@@ -201,6 +201,7 @@ SPECTRE_fnc_serializeUnit = {
 // ─── Serialize one enemy contact to a JSON string ────────────────────────────
 SPECTRE_fnc_serializeContact = {
     params ["_unit", "_contactId"];
+    if (isNull _unit) exitWith { "" }; // enemy may be deleted mid-iteration
 
     private _pos   = getPos _unit;
     private _px    = _pos select 0;
@@ -650,6 +651,7 @@ SPECTRE_fnc_detectEvents = {
     // Also detect newly spotted enemy vehicles
     {
         private _enemy    = _x;
+        if (isNull _enemy) continue;
         private _enemyKey = str _enemy;
 
         if (!(_enemyKey in SPECTRE_spottedEnemies)) then {
@@ -745,8 +747,13 @@ SPECTRE_fnc_broadcastState = {
     _allEnemies = _allEnemies arrayIntersect _allEnemies;
     {
         private _e = _x;
-        diag_log format ["SPECTRE_CONTACT:%1", [_e, format ["HOSTILE-%1", _ci]] call SPECTRE_fnc_serializeContact];
-        _ci = _ci + 1;
+        if (!isNull _e) then {
+            private _contactJson = [_e, format ["HOSTILE-%1", _ci]] call SPECTRE_fnc_serializeContact;
+            if (_contactJson != "") then {
+                diag_log format ["SPECTRE_CONTACT:%1", _contactJson];
+            };
+            _ci = _ci + 1;
+        };
     } forEach _allEnemies;
 
     // Send events (usually few, one line)
@@ -832,12 +839,22 @@ SPECTRE_execCmdIds = [];
 
         if (_t - _lastBroadcast >= SPECTRE_broadcastRate) then {
             _lastBroadcast = _t;
-            call SPECTRE_fnc_broadcastState;
+            // Wrap in try/catch so a single bad unit/contact can never kill
+            // the whole bridge loop (which would silently disconnect the app).
+            try {
+                call SPECTRE_fnc_broadcastState;
+            } catch {
+                diag_log format ["SPECTRE broadcast error: %1", _exception];
+            };
         };
 
         if (_t - _lastCmdRead >= SPECTRE_cmdReadRate) then {
             _lastCmdRead = _t;
-            call SPECTRE_fnc_readCommands;
+            try {
+                call SPECTRE_fnc_readCommands;
+            } catch {
+                diag_log format ["SPECTRE readCommands error: %1", _exception];
+            };
         };
 
         // uiSleep uses real time, NOT simulation time.
