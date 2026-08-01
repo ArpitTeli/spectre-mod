@@ -31,6 +31,9 @@ SPECTRE_mapCoords set ["cola",     [-23.0, -68.0, 111000, 95000]];
 SPECTRE_blufor         = [];
 SPECTRE_spottedEnemies = [];
 SPECTRE_initialized    = false;
+// Maps contact IDs ("HOSTILE-N") -> enemy object so ATTACK/KAMIKAZE commands
+// can resolve their target by the ID the app sends. Rebuilt each broadcast.
+SPECTRE_contactMap     = createHashMap;
 
 // ─── Get map coordinate data ──────────────────────────────────────────────────
 private _mapName = toLowerANSI worldName;
@@ -257,7 +260,11 @@ SPECTRE_fnc_execCmd = {
 
         case "KAMIKAZE": {
             private _drone = _unit;
-            private _target = missionNamespace getVariable [_roe, objNull];
+            // Resolve target: contact map first (HOSTILE-N), then missionNamespace
+            private _target = SPECTRE_contactMap getOrDefault [_roe, objNull];
+            if (isNull _target) then {
+                _target = missionNamespace getVariable [_roe, objNull];
+            };
             if (!isNull _drone && !isNull _target) then {
                 if (count _waypoints > 1) then {
                     // Multi-waypoint terrain-following flight profile
@@ -474,7 +481,11 @@ SPECTRE_fnc_execCmd = {
 
         case "ATTACK": {
             if (!isNull _unit) then {
-                private _target = missionNamespace getVariable [_roe, objNull];
+                // Resolve target: contact map first (HOSTILE-N), then missionNamespace
+                private _target = SPECTRE_contactMap getOrDefault [_roe, objNull];
+                if (isNull _target) then {
+                    _target = missionNamespace getVariable [_roe, objNull];
+                };
                 if (!isNull _target) then {
                     private _veh = vehicle _unit;
                     if (_veh != _unit) then {
@@ -746,10 +757,14 @@ SPECTRE_fnc_broadcastState = {
     };
     private _allEnemies = _enemyInfantry + _enemyVehicles;
     _allEnemies = _allEnemies arrayIntersect _allEnemies;
+    // Rebuild the contact-ID -> object map so ATTACK/KAMIKAZE can resolve targets.
+    SPECTRE_contactMap = createHashMap;
     {
         private _e = _x;
         if (!isNull _e) then {
-            private _contactJson = [_e, format ["HOSTILE-%1", _ci]] call SPECTRE_fnc_serializeContact;
+            private _cid = format ["HOSTILE-%1", _ci];
+            SPECTRE_contactMap set [_cid, _e];
+            private _contactJson = [_e, _cid] call SPECTRE_fnc_serializeContact;
             if (_contactJson != "") then {
                 diag_log format ["SPECTRE_CONTACT:%1", _contactJson];
             };
