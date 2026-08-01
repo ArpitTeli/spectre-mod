@@ -1,5 +1,5 @@
 /*
-  SPECTRE C2 Bridge - Arma 3 PBO Addon v2.2
+  SPECTRE C2 Bridge - Arma 3 PBO Addon v2.3
   ===========================================
   Auto-executed via CBA XEH PostInit.
   No manual init.sqf editing needed — just enable the mod.
@@ -11,9 +11,9 @@
                     This script reads it with loadFile + call compile every 0.75s.
 */
 
-// ─── Rate config ─────────────────────────────────────────────────────────────
-private _broadcastRate = 1.0;
-private _cmdReadRate   = 0.75;
+// ─── Rate config (globals — spawn block can't see private locals) ─────────────
+SPECTRE_broadcastRate = 0.5;
+SPECTRE_cmdReadRate   = 0.3;
 
 // ─── Map coordinate lookup ────────────────────────────────────────────────────
 // Format: [origin_lat, origin_lng, meters_per_lat, meters_per_lng]
@@ -29,27 +29,47 @@ SPECTRE_mapCoords set ["cola",     [-23.0, -68.0, 111000, 95000]];
 
 // ─── Global state ─────────────────────────────────────────────────────────────
 SPECTRE_blufor         = [];
-SPECTRE_executedCmds   = [];
 SPECTRE_spottedEnemies = [];
 SPECTRE_initialized    = false;
 
 // ─── Get map coordinate data ──────────────────────────────────────────────────
 private _mapName = toLowerANSI worldName;
-private _mapData = SPECTRE_mapCoords getOrDefault [_mapName, [0, 0, 111000, 85000]];
+SPECTRE_mapData = SPECTRE_mapCoords getOrDefault [_mapName, [0, 0, 111000, 85000]];
 
-// ─── Collect friendly units ───────────────────────────────────────────────────
-SPECTRE_blufor = allUnits select { side _x == west || side _x == blufor };
+// ─── Collect friendly units and vehicles ──────────────────────────────────────
+SPECTRE_blufor = [];
 
-if (SPECTRE_blufor isEqualTo []) then {
-    SPECTRE_blufor = allUnits select {
+// Infantry
+private _infantry = allUnits select { side _x == west || side _x == blufor };
+if (_infantry isEqualTo []) then {
+    _infantry = allUnits select {
         isPlayer _x || (!(vehicle _x isEqualTo _x) && side _x == west)
     };
 };
+SPECTRE_blufor append _infantry;
 
+// Vehicles (only crewed or player-owned)
+private _vehicles = vehicles select {
+    side _x == west || side _x == blufor
+};
 {
+    if !(_x in SPECTRE_blufor) then {
+        SPECTRE_blufor pushBack _x;
+    };
+} forEach _vehicles;
+
+// Assign variable names to units that don't have one (for command targeting)
+{
+    private _vn = vehicleVarName _x;
+    if (_vn isEqualTo "") then {
+        _vn = format ["SPECTRE_%1", _forEachIndex];
+        _x setVehicleVarName _vn;
+        // Also register in missionNamespace so getVariable works
+        missionNamespace setVariable [_vn, _x];
+    };
     _x setVariable ["SPECTRE_spawnPos",     getPos _x,          false];
     _x setVariable ["SPECTRE_wasAlive",     alive _x,           false];
-    _x setVariable ["SPECTRE_callsign",     vehicleVarName _x,  false];
+    _x setVariable ["SPECTRE_callsign",     _vn,                false];
     _x setVariable ["SPECTRE_currentOrder", "",                 false];
 } forEach SPECTRE_blufor;
 
@@ -58,19 +78,21 @@ diag_log format ["SPECTRE: Initialized — tracking %1 blufor assets on %2", cou
 // ─── Vehicle type classifier ──────────────────────────────────────────────────
 SPECTRE_fnc_vehicleType = {
     params ["_v"];
-    if (_v isKindOf "Tank")       exitWith { "MBT"      };
-    if (_v isKindOf "Helicopter") exitWith { "HELI"     };
-    if (_v isKindOf "Plane")      exitWith { "PLANE"    };
-    if (_v isKindOf "APC_Wheeled_01_base_F") exitWith { "APC" };
-    if (_v isKindOf "IFV_01_base_F"         ||
-        _v isKindOf "IFV_02_base_F"         ||
-        _v isKindOf "IFV_03_base_F"         ||
-        _v isKindOf "APC_Tracked_01_base_F" ||
-        _v isKindOf "APC_Tracked_02_base_F" ||
-        _v isKindOf "APC_Tracked_03_base_F") exitWith { "IFV" };
-    if (_v isKindOf "Car")   exitWith { "RECON"    };
-    if (_v isKindOf "Truck_F") exitWith { "TRUCK"  };
-    if (_v isKindOf "Man")   exitWith { "INFANTRY" };
+    private _t = typeOf _v;
+    // Drones — check class name patterns first
+    if ("FPV" in _t) exitWith { "FPV" };
+    if (_v isKindOf "UAV_01_base_F") exitWith { "UAV" };
+    if ("UGV_01" in _t) exitWith { "STOMPER" };
+    if ("UGV_02" in _t) exitWith { "ED1" };
+    // Conventional types
+    if (_v isKindOf "Helicopter")  exitWith { "HELI" };
+    if (_v isKindOf "Plane")       exitWith { "PLANE" };
+    if (_v isKindOf "Ship")        exitWith { "BOAT" };
+    if (_v isKindOf "Truck_F")     exitWith { "TRUCK" };
+    if (_v isKindOf "Tank")        exitWith { "TANK" };
+    if (_v isKindOf "Wheeled_APC_F") exitWith { "IFV" };
+    if (_v isKindOf "Car")         exitWith { "CAR" };
+    if (_v isKindOf "Man")         exitWith { "INFANTRY" };
     "VEHICLE"
 };
 
@@ -87,30 +109,92 @@ SPECTRE_fnc_serializeUnit = {
     private _pos   = getPos _unit;
     private _px    = _pos select 0;
     private _py    = _pos select 1;
+    private _pz    = _pos select 2;
     private _hp    = round ((1 - getDammage _unit) * 100);
-    private _fuel  = if (_unit isKindOf "Man") then { 100 } else { round (fuel _unit * 100) };
-    private _type  = if (_unit isKindOf "Man") then { "INFANTRY" } else { "VEHICLE" };
     private _vtype = [_unit] call SPECTRE_fnc_vehicleType;
     private _order = (_unit getVariable ["SPECTRE_currentOrder", ""]) regexReplace ["""", ""];
     private _status = if (!alive _unit) then { "DEAD" } else { "READY" };
 
     // Map coordinate conversion using lookup table
-    private _originLat = _mapData select 0;
-    private _originLng = _mapData select 1;
-    private _mPerLat   = _mapData select 2;
-    private _mPerLng   = _mapData select 3;
+    private _originLat = SPECTRE_mapData select 0;
+    private _originLng = SPECTRE_mapData select 1;
+    private _mPerLat   = SPECTRE_mapData select 2;
+    private _mPerLng   = SPECTRE_mapData select 3;
     private _lat = _originLat + (_py / _mPerLat);
     private _lng = _originLng + (_px / _mPerLng);
 
+    // Fuel (vehicles only)
+    private _fuelStr = "";
+    if !(_unit isKindOf "Man") then {
+        _fuelStr = format [",""fuel"":%1", round (fuel _unit * 100)];
+    };
+
+    // Speed in km/h (vehicles only)
+    private _speedStr = "";
+    if !(_unit isKindOf "Man") then {
+        _speedStr = format [",""speed"":%1", round (speed _unit)];
+    };
+
+    // Ammo count (total magazines)
+    private _ammoStr = format [",""ammo"":%1", count magazines _unit];
+
+    // Vehicle membership (for infantry inside vehicles)
+    private _vehicleStr = "";
+    private _roleStr = "";
+    if (_unit isKindOf "Man") then {
+        private _veh = vehicle _unit;
+        if !(_veh isEqualTo _unit) then {
+            private _vcs = _veh getVariable ["SPECTRE_callsign", vehicleVarName _veh];
+            if (_vcs isEqualTo "") then {
+                _vcs = format ["UNIT_%1", SPECTRE_blufor find _veh];
+            };
+            _vehicleStr = format [",""vehicle"":""%1""", _vcs regexReplace ["""", ""]];
+            private _role = assignedVehicleRole _unit;
+            if (count _role > 0) then {
+                _roleStr = format [",""vehicle_role"":""%1""", _role select 0];
+            };
+        };
+    };
+
+    // Crew list (for vehicles)
+    private _crewStr = "";
+    if !(_unit isKindOf "Man") then {
+        private _crewArr = [];
+        {
+            private _ccs = _x getVariable ["SPECTRE_callsign", vehicleVarName _x];
+            if (_ccs isEqualTo "") then {
+                _ccs = format ["UNIT_%1", SPECTRE_blufor find _x];
+            };
+            private _crole = assignedVehicleRole _x;
+            private _croleStr = if (count _crole > 0) then { _crole select 0 } else { "CARGO" };
+            _crewArr pushBack format ["""%1:%2""", _ccs regexReplace ["""", ""], _croleStr];
+        } forEach (crew _unit);
+        if (count _crewArr > 0) then {
+            _crewStr = format [",""crew"":[%1]", _crewArr joinString ","];
+        };
+    };
+
+    private _orderStr = "";
+    if !(_order isEqualTo "") then {
+        _orderStr = format [",""order"":""%1""", _order];
+    };
+
     format [
-        "{""id"":""%1"",""callsign"":""%2"",""type"":""%3"",""vehicle_type"":""%4"",""position"":{""x"":%5,""y"":%6,""lat"":%7,""lng"":%8},""heading"":%9,""health"":%10,""fuel"":%11,""ammo"":100,""status"":""%12"",""current_order"":""%13""}",
-        _cs, _cs,
-        _type, _vtype,
+        "{""id"":""%1"",""vtype"":""%2"",""pos"":{""x"":%3,""y"":%4,""z"":%5,""lat"":%6,""lng"":%7},""hdg"":%8,""hp"":%9%10%11%12%13%14%15%16,""st"":""%17""}",
+        _cs, _vtype,
         round _px, round _py,
+        round _pz,
         _lat, _lng,
         round getDir _unit,
-        _hp, _fuel,
-        _status, _order
+        _hp,
+        _fuelStr,
+        _speedStr,
+        _ammoStr,
+        _vehicleStr,
+        _roleStr,
+        _crewStr,
+        _orderStr,
+        _status
     ]
 };
 
@@ -123,10 +207,10 @@ SPECTRE_fnc_serializeContact = {
     private _py    = _pos select 1;
     private _type  = [_unit] call SPECTRE_fnc_vehicleType;
 
-    private _originLat = _mapData select 0;
-    private _originLng = _mapData select 1;
-    private _mPerLat   = _mapData select 2;
-    private _mPerLng   = _mapData select 3;
+    private _originLat = SPECTRE_mapData select 0;
+    private _originLng = SPECTRE_mapData select 1;
+    private _mPerLat   = SPECTRE_mapData select 2;
+    private _mPerLng   = SPECTRE_mapData select 3;
     private _lat = _originLat + (_py / _mPerLat);
     private _lng = _originLng + (_px / _mPerLng);
 
@@ -136,6 +220,22 @@ SPECTRE_fnc_serializeContact = {
         round _px, round _py,
         _lat, _lng
     ]
+};
+
+// ─── Artillery strike helper ──────────────────────────────────────────────────
+SPECTRE_fnc_artilleryStrike = {
+    params ["_unit", "_targetPos", "_rounds", "_ammoType"];
+    private _veh = vehicle _unit;
+
+    for "_i" from 1 to _rounds do {
+        [_veh, [_targetPos select 0, _targetPos select 1, 0], _ammoType] spawn {
+            params ["_v", "_tp", "_ammo"];
+            private _delay = random 2;
+            sleep _delay;
+            _v doArtilleryFire [_tp, _ammo];
+        };
+    };
+    diag_log format ["SPECTRE: Artillery %1x %2 fired at %3", _rounds, _ammoType, _targetPos];
 };
 
 // ─── Command executor ─────────────────────────────────────────────────────────
@@ -149,27 +249,64 @@ SPECTRE_fnc_execCmd = {
         ["_action",    ""]
     ];
 
-    if (_id in SPECTRE_executedCmds) exitWith {};
-    SPECTRE_executedCmds pushBack _id;
-    if (count SPECTRE_executedCmds > 600) then {
-        SPECTRE_executedCmds = SPECTRE_executedCmds select [300, (count SPECTRE_executedCmds) - 300];
-    };
-
     private _unit = missionNamespace getVariable [_unitId, objNull];
-    diag_log format ["SPECTRE CMD: %1 -> %2", _type, _unitId];
+    diag_log format ["SPECTRE CMD: %1 -> %2 (units=%3)", _type, _unitId, count SPECTRE_blufor];
 
     switch (_type) do {
 
+        case "KAMIKAZE": {
+            private _drone = _unit;
+            private _target = missionNamespace getVariable [_roe, objNull];
+            if (!isNull _drone && !isNull _target) then {
+                if (count _waypoints > 1) then {
+                    // Multi-waypoint terrain-following flight profile
+                    [_drone, _target, _waypoints] spawn {
+                        params ["_drone", "_target", "_wps"];
+                    private _wpIdx = 0;
+                    while {alive _drone && alive _target && _wpIdx < count _wps} do {
+                        private _wp = _wps select _wpIdx;
+                        private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
+                        private _pos = [_wp select 0, _wp select 1, _alt];
+                            _drone doMove _pos;
+                            // Wait until drone is within 40m of waypoint or dead
+                            private _timeout = time + 30;
+                            waitUntil {
+                                sleep 0.1;
+                                (alive _drone && (_drone distance _pos) < 40) || !alive _drone || time > _timeout
+                            };
+                            _wpIdx = _wpIdx + 1;
+                        };
+                        // Final phase: ensure drone is heading to target ground position
+                        if (alive _drone && alive _target) then {
+                            _drone doMove (getPos _target);
+                        };
+                    };
+                } else {
+                    // Simple direct approach (fallback) — 60s timeout
+                    [_drone, _target] spawn {
+                        params ["_drone", "_target"];
+                        private _timeout = time + 60;
+                        while {alive _drone && alive _target && time < _timeout} do {
+                            _drone doMove (getPos _target);
+                            sleep 0.1;
+                        };
+                    };
+                };
+                _drone setVariable ["SPECTRE_currentOrder", "KAMIKAZE", false];
+                diag_log format ["SPECTRE KAMIKAZE [%1] -> %2 (wps=%3)", _unitId, _roe, count _waypoints];
+            };
+        };
+
         case "HOLD": {
             if (!isNull _unit) then {
-                _unit doStop _unit;
+                doStop _unit;
                 _unit setVariable ["SPECTRE_currentOrder", "HOLD", false];
             };
         };
 
         case "HOLD_ALL": {
             {
-                _x doStop _x;
+                doStop _x;
                 _x setVariable ["SPECTRE_currentOrder", "HOLD", false];
             } forEach SPECTRE_blufor;
         };
@@ -273,6 +410,194 @@ SPECTRE_fnc_execCmd = {
                 diag_log format ["SPECTRE CUSTOM [%1]: %2", _unitId, _action];
             };
         };
+
+        case "MOVE_TO": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _veh = vehicle _unit;
+                private _grp = group _unit;
+
+                // Parse speed from _action param (format: "speed:120")
+                private _speedStr = _action;
+                private _spd = "NORMAL";
+                if (_speedStr find "speed:" >= 0) then {
+                    private _val = parseNumber (_speedStr select [6]);
+                    if (_val > 0) then {
+                        if (_val < 80) then { _spd = "LIMITED"; }
+                        else { if (_val > 160) then { _spd = "FULL"; }; };
+                    };
+                };
+
+                // Multi-waypoint: use group waypoint system
+                if (count _waypoints > 1) then {
+                    // Clear existing group waypoints
+                    while { count (waypoints _grp) > 0 } do {
+                        deleteWaypoint ((waypoints _grp) select 0);
+                    };
+
+                    {
+                        private _wpData = _x;
+                        private _alt = if (count _wpData > 2) then { _wpData select 2 } else { -1 };
+                        // Bake altitude into the waypoint Z (ASL). Arma has no
+                        // setWaypointAltitude command; air units follow flyInHeight.
+                        private _pos = [_wpData select 0, _wpData select 1, (_alt max 0)];
+                        private _newWp = _grp addWaypoint [_pos, 80];
+                        _newWp setWaypointType "MOVE";
+                        _newWp setWaypointSpeed _spd;
+                        _newWp setWaypointStatements ["true", ""];
+                        if (_alt >= 0 && { _veh isKindOf "Air" }) then {
+                            _veh flyInHeight _alt;
+                        };
+                    } forEach _waypoints;
+
+                    _unit setVariable ["SPECTRE_currentOrder", "MOVE TO (MULTI)", false];
+                    diag_log format ["SPECTRE MOVE_TO [%1]: %2 waypoints, speed %3", _unitId, count _waypoints, _spd];
+                } else {
+                    // Single waypoint: direct doMove
+                    private _wp = _waypoints select 0;
+                    private _pos = [_wp select 0, _wp select 1, 0];
+                    if (_veh != _unit) then {
+                        private _d = driver _veh;
+                        if (!isNull _d) then {
+                            _d doMove _pos;
+                        } else {
+                            _unit doMove _pos;
+                        };
+                    } else {
+                        _unit doMove _pos;
+                    };
+                    _unit setVariable ["SPECTRE_currentOrder", "MOVE TO", false];
+                    diag_log format ["SPECTRE MOVE_TO [%1]: %2", _unitId, _pos];
+                };
+            };
+        };
+
+        case "ATTACK": {
+            if (!isNull _unit) then {
+                private _target = missionNamespace getVariable [_roe, objNull];
+                if (!isNull _target) then {
+                    private _veh = vehicle _unit;
+                    if (_veh != _unit) then {
+                        private _g = gunner _veh;
+                        if (!isNull _g) then {
+                            _g doTarget _target;
+                            _g doFire _target;
+                        } else {
+                            _unit doTarget _target;
+                            _unit doFire _target;
+                        };
+                    } else {
+                        _unit doTarget _target;
+                        _unit doFire _target;
+                    };
+                    _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
+                    diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
+                };
+            };
+        };
+
+        case "ATTACK_POS": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                private _pos = [_wp select 0, _wp select 1, 0];
+                private _veh = vehicle _unit;
+                private _tgt = "Sign_Arrow_Red_F" createVehicle _pos;
+                if (_veh != _unit) then {
+                    private _g = gunner _veh;
+                    if (!isNull _g) then {
+                        _g doTarget _tgt;
+                        _g doFire _tgt;
+                    } else {
+                        _unit doTarget _tgt;
+                        _unit doFire _tgt;
+                    };
+                } else {
+                    _unit doTarget _tgt;
+                    _unit doFire _tgt;
+                };
+                [_tgt] spawn { sleep 10; deleteVehicle (_this select 0); };
+                _unit setVariable ["SPECTRE_currentOrder", "FIRE AT POSITION", false];
+                diag_log format ["SPECTRE ATTACK_POS [%1]: %2", _unitId, _pos];
+            };
+        };
+
+        case "ARTILLERY_STRIKE": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                private _targetPos = [_wp select 0, _wp select 1, 0];
+                private _rounds = parseNumber _roe;
+                if (_rounds <= 0) then { _rounds = 6; };
+                private _ammo = _action;
+                if (_ammo isEqualTo "") then { _ammo = "HE"; };
+
+                private _veh = vehicle _unit;
+                if (_veh != _unit) then {
+                    [_veh, _targetPos, _rounds, _ammo] call SPECTRE_fnc_artilleryStrike;
+                } else {
+                    [_unit, _targetPos, _rounds, _ammo] call SPECTRE_fnc_artilleryStrike;
+                };
+                _unit setVariable ["SPECTRE_currentOrder", format ["ARTILLERY %1x %2", _rounds, _ammo], false];
+                diag_log format ["SPECTRE ARTILLERY [%1]: %2 rounds %3 at %4", _unitId, _rounds, _ammo, _targetPos];
+            };
+        };
+
+        case "LAND_AT": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                private _pos = [_wp select 0, _wp select 1, 0];
+                private _veh = vehicle _unit;
+                if (_veh != _unit && {_veh isKindOf "Air"}) then {
+                    _veh doMove _pos;
+                    _veh land "LAND";
+                } else {
+                    _unit doMove _pos;
+                };
+                _unit setVariable ["SPECTRE_currentOrder", "LAND AT", false];
+                diag_log format ["SPECTRE LAND_AT [%1]: %2", _unitId, _pos];
+            };
+        };
+
+        case "SMOKE_AT": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                private _pos = [_wp select 0, _wp select 1, 0];
+                "SmokeShell" createVehicle _pos;
+                _unit setVariable ["SPECTRE_currentOrder", "SMOKE", false];
+                diag_log format ["SPECTRE SMOKE_AT [%1]: %2", _unitId, _pos];
+            };
+        };
+
+        case "ADJUST_FIRE": {
+            if (!isNull _unit && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                private _pos = [_wp select 0, _wp select 1, 0];
+                private _veh = vehicle _unit;
+                private _tgt = "Sign_Arrow_Red_F" createVehicle _pos;
+                if (_veh != _unit) then {
+                    private _g = gunner _veh;
+                    if (!isNull _g) then {
+                        _g doTarget _tgt;
+                    } else {
+                        _unit doTarget _tgt;
+                    };
+                } else {
+                    _unit doTarget _tgt;
+                };
+                [_tgt] spawn { sleep 10; deleteVehicle (_this select 0); };
+                _unit setVariable ["SPECTRE_currentOrder", "ADJUST FIRE", false];
+                diag_log format ["SPECTRE ADJUST_FIRE [%1]: %2", _unitId, _pos];
+            };
+        };
+
+        case "HOVER": {
+            if (!isNull _unit) then {
+                private _veh = vehicle _unit;
+                if (_veh != _unit && {_veh isKindOf "Air"}) then {
+                    _veh flyInHeight 50;
+                    _unit setVariable ["SPECTRE_currentOrder", "HOVER", false];
+                };
+                diag_log format ["SPECTRE HOVER [%1]", _unitId];
+            };
+        };
     };
 };
 
@@ -322,93 +647,201 @@ SPECTRE_fnc_detectEvents = {
         { _x knowsAbout _e > 0.3 } count SPECTRE_blufor > 0
     });
 
-    _evts
-};
-
-// ─── Full state broadcast via diag_log ────────────────────────────────────────
-SPECTRE_fnc_broadcastState = {
-    private _unitStrs = [];
-    { if (!isNull _x) then { _unitStrs pushBack ([_x] call SPECTRE_fnc_serializeUnit); }; } forEach SPECTRE_blufor;
-
-    private _contactStrs = [];
+    // Also detect newly spotted enemy vehicles
     {
-        _contactStrs pushBack ([_x, format ["HOSTILE-%1", _forEachIndex]] call SPECTRE_fnc_serializeContact);
-    } forEach (allUnits select {
+        private _enemy    = _x;
+        private _enemyKey = str _enemy;
+
+        if (!(_enemyKey in SPECTRE_spottedEnemies)) then {
+            private _spotters = SPECTRE_blufor select { _x knowsAbout _enemy > 0.3 };
+            if (count _spotters > 0) then {
+                SPECTRE_spottedEnemies pushBack _enemyKey;
+                if (count SPECTRE_spottedEnemies > 200) then {
+                    SPECTRE_spottedEnemies = SPECTRE_spottedEnemies select [100, (count SPECTRE_spottedEnemies) - 100];
+                };
+                private _su        = _spotters select 0;
+                private _spotterCs = _su getVariable ["SPECTRE_callsign", vehicleVarName _su];
+                _evts pushBack format [
+                    "{""type"":""CONTACT_SPOTTED"",""unit"":""%1"",""contact_type"":""%2"",""id"":""CS_%3_%4""}",
+                    _spotterCs,
+                    [_enemy] call SPECTRE_fnc_vehicleType,
+                    SPECTRE_blufor find _su,
+                    round time
+                ];
+            };
+        };
+    } forEach (vehicles select {
         private _e = _x;
+        !(crew _e isEqualTo []) &&
         (side _e == east || side _e == independent) &&
         alive _e &&
         { _x knowsAbout _e > 0.3 } count SPECTRE_blufor > 0
     });
 
-    private _eventStrs = call SPECTRE_fnc_detectEvents;
+    // Enemy kill detection
+    {
+        private _enemy    = _x;
+        private _enemyKey = str _enemy;
+        private _wasAlive = _enemy getVariable ["SPECTRE_enemyWasAlive", false];
 
-    // Get mission path and map name for desktop app auto-detection
-    private _missionPath = getMissionPath "";
-    private _mapName     = worldName;
-
-    // Get Arma version for compatibility check
-    private _armaVersion = "unknown";
-    private _versionInfo = productVersion;
-    if (count _versionInfo > 1) then {
-        _armaVersion = _versionInfo select 1;
+        if (_wasAlive && !alive _enemy) then {
+            _enemy setVariable ["SPECTRE_enemyWasAlive", false, false];
+            private _cs = [_enemy] call SPECTRE_fnc_vehicleType;
+            _evts pushBack format [
+                "{""type"":""ENEMY_KILLED"",""contact_type"":""%1"",""id"":""EK_%2_%3""}",
+                _cs, _enemyKey, round time
+            ];
+        } else {
+            _enemy setVariable ["SPECTRE_enemyWasAlive", alive _enemy, false];
+        };
+    } forEach (allUnits + vehicles) select {
+        (side _x == east || side _x == independent) && !(_x isKindOf "Logic")
     };
 
-    private _json = format [
-        "{""missionFolder"":""%1"",""mapName"":""%2"",""armaVersion"":""%3"",""units"":[%4],""contacts"":[%5],""events"":[%6],""timestamp"":%7}",
-        _missionPath regexReplace ["\\", "\\\\"],
-        _mapName,
-        _armaVersion,
-        _unitStrs    joinString ",",
-        _contactStrs joinString ",",
-        _eventStrs   joinString ",",
-        round (time * 1000)
-    ];
+    _evts
+};
 
-    diag_log format ["SPECTRE_STATE:%1", _json];
+// ─── Full state broadcast via diag_log (one line per unit to avoid RPT truncation) ──
+SPECTRE_fnc_broadcastState = {
+    private _ts = round (time * 1000);
+
+    // Send metadata (short line, won't truncate)
+    private _mapName = worldName;
+    private _mp = getMissionPath "";
+    private _mf = "";
+    private _fullPath = (_mp regexReplace ["\\\\$", ""]); // full path without trailing backslash
+    if (count _fullPath > 0) then {
+        private _parts = _fullPath splitString "\\";
+        private _cnt = count _parts;
+        if (_cnt >= 2) then {
+            _mf = format ["%1\\%2", _parts select (_cnt - 2), _parts select (_cnt - 1)];
+        } else { _mf = _fullPath; };
+    };
+    diag_log format ["SPECTRE_META:{""map"":""%1"",""mf"":""%2"",""path"":""%3"",""ts"":%4}", _mapName, _mf regexReplace ["\\", "\\\\"], _fullPath regexReplace ["\\", "\\\\"], _ts];
+
+    // Send each unit on its own line (well under 1024 char RPT limit)
+    {
+        if (!isNull _x) then {
+            diag_log format ["SPECTRE_UNIT:%1", [_x] call SPECTRE_fnc_serializeUnit];
+        };
+    } forEach SPECTRE_blufor;
+
+    // Send contacts (one per line) — include both infantry and vehicles
+    private _ci = 0;
+    private _enemyInfantry = allUnits select {
+        private _e = _x;
+        (side _e == east || side _e == independent) &&
+        alive _e &&
+        { _x knowsAbout _e > 0.3 } count SPECTRE_blufor > 0
+    };
+    private _enemyVehicles = vehicles select {
+        private _e = _x;
+        !(crew _e isEqualTo []) &&
+        (side _e == east || side _e == independent) &&
+        alive _e &&
+        { _x knowsAbout _e > 0.3 } count SPECTRE_blufor > 0
+    };
+    private _allEnemies = _enemyInfantry + _enemyVehicles;
+    _allEnemies = _allEnemies arrayIntersect _allEnemies;
+    {
+        private _e = _x;
+        diag_log format ["SPECTRE_CONTACT:%1", [_e, format ["HOSTILE-%1", _ci]] call SPECTRE_fnc_serializeContact];
+        _ci = _ci + 1;
+    } forEach _allEnemies;
+
+    // Send events (usually few, one line)
+    private _evts = call SPECTRE_fnc_detectEvents;
+    if (count _evts > 0) then {
+        diag_log format ["SPECTRE_EVENTS:[%1]", _evts joinString ","];
+    };
 };
 
 // ─── Command reader ───────────────────────────────────────────────────────────
+// Parses the command file content and executes via execCmd.
+// No call compile — uses direct parsing + function call.
 SPECTRE_fnc_readCommands = {
-    private _sqf = loadFile "spectre_to_arma.sqf";
-    if (!(_sqf isEqualTo "")) then {
-        call compile _sqf;
+    private _result = "spectre_ext" callExtension ["READ", ["addons\spectre_cmds.sqf"]];
+    // Robust: DLL may return ["content"] (array) or "content" (string)
+    private _sqf = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
+    if (isNil "_sqf" || { _sqf isEqualTo "" || { _sqf find "ERR_" == 0 } }) exitWith {};
+
+    // Whole-file dedup: skip re-parsing when the file is byte-identical to last read.
+    if (_sqf == SPECTRE_lastSQF) exitWith {};
+    SPECTRE_lastSQF = _sqf;
+
+    // The file holds MANY commands, one per line, each ending in
+    //   ... call SPECTRE_fnc_execCmd;
+    // Split on CR and LF (drops blank lines), then run every command line.
+    // Per-command-id dedup means new lines run even if earlier lines are unchanged.
+    private _lines = _sqf splitString (toString [13, 10]);
+    private _ran = 0;
+
+    {
+        private _line = _x;
+        private _callIdx = _line find " call SPECTRE_fnc_execCmd;";
+        if (_callIdx >= 0) then {
+            private _argsStr = _line select [0, _callIdx];
+            // Trim leading whitespace so indented lines still parse.
+            while { count _argsStr > 0 && { (_argsStr select [0, 1]) in [" ", toString [9]] } } do {
+                _argsStr = _argsStr select [1];
+            };
+            if (count _argsStr > 0 && { _argsStr select [0, 1] == "[" }) then {
+                private _args = call compile _argsStr;
+                if (!isNil "_args" && { typeName _args == "ARRAY" } && { count _args > 0 }) then {
+                    private _cmdId = _args select 0;
+                    // Skip commands we've already executed (per-id dedup).
+                    if !(_cmdId in SPECTRE_execCmdIds) then {
+                        SPECTRE_execCmdIds pushBack _cmdId;
+                        _args call SPECTRE_fnc_execCmd;
+                        _ran = _ran + 1;
+                        diag_log format ["SPECTRE: Executed OK: %1", _argsStr select [0, 50]];
+                    };
+                } else {
+                    diag_log format ["SPECTRE: Bad args: %1", _argsStr];
+                };
+            };
+        };
+    } forEach _lines;
+
+    // Keep the executed-id list bounded (the file is capped to the last 50 cmds).
+    if (count SPECTRE_execCmdIds > 200) then {
+        SPECTRE_execCmdIds = SPECTRE_execCmdIds select [(count SPECTRE_execCmdIds) - 100];
+    };
+
+    if (_ran > 0) then {
+        diag_log format ["SPECTRE: CMD batch ran %1 new command(s)", _ran];
     };
 };
 
-// ─── Per-unit event handlers (immediate, not waiting for the poll loop) ───────
-{
-    private _u = _x;
-    _u addEventHandler ["Killed", {
-        params ["_killed"];
-        private _cs = _killed getVariable ["SPECTRE_callsign", vehicleVarName _killed];
-        private _t  = if (_killed isKindOf "Man") then { "UNIT_KIA" } else { "VEHICLE_DESTROYED" };
-        diag_log format [
-            "SPECTRE_EVENT:{""type"":""%1"",""unit"":""%2"",""id"":""%1_%2_%3""}",
-            _t, _cs, round time
-        ];
-    }];
-} forEach SPECTRE_blufor;
-
 // ─── Main loop ────────────────────────────────────────────────────────────────
 hint "SPECTRE C2 Bridge: ACTIVE";
-diag_log "SPECTRE: Bridge running. Broadcasting every 1s, reading commands every 0.75s.";
+diag_log "SPECTRE: Bridge running (wall-clock mode). Broadcasting every 0.5s, reading commands every 0.3s.";
 SPECTRE_initialized = true;
+SPECTRE_lastSQF = "";
+SPECTRE_execCmdIds = [];
 
-private _lastBroadcast = -999;
-private _lastCmdRead   = -999;
+[] spawn {
+    private _lastBroadcast = -999;
+    private _lastCmdRead   = -999;
 
-while { true } do {
-    private _t = time;
+    while { true } do {
+        // diag_tickTime = real wall-clock time, NOT affected by Arma's
+        // simulation throttle when backgrounded. This keeps broadcasts
+        // running even when the user alt-tabs away from Arma.
+        private _t = diag_tickTime;
 
-    if (_t - _lastBroadcast >= _broadcastRate) then {
-        _lastBroadcast = _t;
-        call SPECTRE_fnc_broadcastState;
+        if (_t - _lastBroadcast >= SPECTRE_broadcastRate) then {
+            _lastBroadcast = _t;
+            call SPECTRE_fnc_broadcastState;
+        };
+
+        if (_t - _lastCmdRead >= SPECTRE_cmdReadRate) then {
+            _lastCmdRead = _t;
+            call SPECTRE_fnc_readCommands;
+        };
+
+        // uiSleep uses real time, NOT simulation time.
+        // Regular sleep slows to a crawl when Arma is backgrounded.
+        uiSleep 0.1;
     };
-
-    if (_t - _lastCmdRead >= _cmdReadRate) then {
-        _lastCmdRead = _t;
-        call SPECTRE_fnc_readCommands;
-    };
-
-    sleep 0.1;
 };

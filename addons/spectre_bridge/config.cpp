@@ -3,9 +3,9 @@ class CfgPatches {
         name = "SPECTRE C2 Bridge";
         author = "SPECTRE";
         requiredVersion = 2.06;
-        requiredAddons[] = {"CBA_A3"};
-        version = "1.1.0";
-        versionStr = "1.1.0";
+        requiredAddons[] = {};
+        version = "1.2.0";
+        versionStr = "1.2.0";
         units[] = {};
         weapons[] = {};
     };
@@ -16,13 +16,10 @@ class CfgFunctions {
         tag = "SPECTRE";
         class bridge {
             file = "z\spectre\addons\spectre_bridge\functions";
-            class bridgeInit {};
+            // postInit = 1 auto-runs SPECTRE_fnc_bridgeInit at mission start.
+            // This is the vanilla (no-CBA) replacement for the old
+            // Extended_PostInit_EventHandlers block. No mission init.sqf needed.
+            class bridgeInit { postInit = 1; };
         };
-    };
-};
-
-class Extended_PostInit_EventHandlers {
-    class SPECTRE_bridge_postInit {
-        init = "call compile preprocessFileLineNumbers '\z\spectre\addons\spectre_bridge\XEH_postInit.sqf'";
     };
 };
