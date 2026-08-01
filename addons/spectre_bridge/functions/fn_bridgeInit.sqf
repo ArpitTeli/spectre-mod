@@ -270,12 +270,15 @@ SPECTRE_fnc_execCmd = {
                     // Multi-waypoint terrain-following flight profile
                     [_drone, _target, _waypoints] spawn {
                         params ["_drone", "_target", "_wps"];
+                    // UAVs need a fly height to leave the ground
+                    _drone flyInHeight 50;
                     private _wpIdx = 0;
                     while {alive _drone && alive _target && _wpIdx < count _wps} do {
                         private _wp = _wps select _wpIdx;
                         private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
                         private _pos = [_wp select 0, _wp select 1, _alt];
                             _drone doMove _pos;
+                            _drone flyInHeight _alt;
                             // Wait until drone is within 40m of waypoint or dead
                             private _timeout = time + 30;
                             waitUntil {
@@ -286,6 +289,7 @@ SPECTRE_fnc_execCmd = {
                         };
                         // Final phase: ensure drone is heading to target ground position
                         if (alive _drone && alive _target) then {
+                            _drone flyInHeight 0;
                             _drone doMove (getPos _target);
                         };
                     };
@@ -294,10 +298,15 @@ SPECTRE_fnc_execCmd = {
                     [_drone, _target] spawn {
                         params ["_drone", "_target"];
                         private _timeout = time + 60;
+                        // UAVs need a fly height to leave the ground
+                        _drone flyInHeight 50;
+                        diag_log format ["SPECTRE KAMIKAZE chase start: drone=%1 target=%2", _drone, _target];
                         while {alive _drone && alive _target && time < _timeout} do {
                             _drone doMove (getPos _target);
-                            sleep 0.1;
+                            _drone flyInHeight 50;
+                            sleep 0.5;
                         };
+                        diag_log format ["SPECTRE KAMIKAZE chase end: droneAlive=%1 targetAlive=%2", alive _drone, alive _target];
                     };
                 };
                 _drone setVariable ["SPECTRE_currentOrder", "KAMIKAZE", false];
@@ -846,12 +855,20 @@ SPECTRE_execCmdIds = [];
 [] spawn {
     private _lastBroadcast = -999;
     private _lastCmdRead   = -999;
+    private _lastHint      = -999;
 
     while { true } do {
         // diag_tickTime = real wall-clock time, NOT affected by Arma's
         // simulation throttle when backgrounded. This keeps broadcasts
         // running even when the user alt-tabs away from Arma.
         private _t = diag_tickTime;
+
+        // Re-show the connection hint periodically so it stays visible
+        // (Arma auto-dismisses hints after a few seconds).
+        if (_t - _lastHint >= 20) then {
+            _lastHint = _t;
+            hintSilent "SPECTRE C2 Bridge: ACTIVE";
+        };
 
         if (_t - _lastBroadcast >= SPECTRE_broadcastRate) then {
             _lastBroadcast = _t;
