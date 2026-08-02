@@ -618,15 +618,25 @@ SPECTRE_fnc_execCmd = {
                     private _veh = vehicle _unit;
                     private _g = gunner _veh;
                     if (_veh != _unit && !isNull _g) then {
+                        // AI-level engage (doFire is suppressed under weapons-safe ROE,
+                        // so force RED/COMBAT and issue commandFire as well).
+                        _g setCombatMode "RED";
+                        _g setBehaviour "COMBAT";
                         _g doTarget _target;
+                        _g doWatch _target;
                         _g doFire _target;
-                        // Force fire: bypasses ROE/weapons-safe stalls that block
-                        // AI doFire. fireAtTarget fires the main gun directly.
-                        _veh fireAtTarget [_target, "mainGun"];
-                        diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2", _unitId, _roe];
+                        _g commandFire _target;
+                        // Force-fire the turret's ACTUAL weapon (bypasses ROE).
+                        private _wpn = _veh currentWeaponTurret [0];
+                        if (_wpn == "") then { _wpn = "mainGun"; };
+                        _veh fireAtTarget [_target, _wpn];
+                        diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2 (wpn=%3)", _unitId, _roe, _wpn];
                     } else {
+                        _unit setCombatMode "RED";
+                        _unit setBehaviour "COMBAT";
                         _unit doTarget _target;
                         _unit doFire _target;
+                        _unit commandFire _target;
                         diag_log format ["SPECTRE ATTACK FIRED (no gunner, direct) [%1] -> %2", _unitId, _roe];
                     };
                     _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
