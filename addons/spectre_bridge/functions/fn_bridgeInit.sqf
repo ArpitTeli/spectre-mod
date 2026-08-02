@@ -612,40 +612,25 @@ SPECTRE_fnc_execCmd = {
                         _target = "Sign_Arrow_Red_F" createVehicle [_wp select 0, _wp select 1, 0];
                     };
                 };
-                if (!isNull _target) then {
-                    private _veh = vehicle _unit;
-                    private _firer = if (_veh != _unit && { !isNull (gunner _veh) }) then { gunner _veh } else { _unit };
-                    if (!isNull _firer) then {
-                        private _ammoBefore = count magazines _firer;
-                        _firer doTarget _target;
-                        _firer doFire _target;
-                        // Fire-verification ladder: if nothing was fired shortly after,
-                        // force the weapon (bypasses AI/ROE stalls) and log the outcome.
-                        [_firer, _target, _unitId, _roe, _veh, _ammoBefore] spawn {
-                            params ["_firer", "_target", "_unitId", "_roe", "_veh", "_ammoBefore"];
-                            uiSleep 1.5;
-                            if (!isNull _firer && !isNull _target) then {
-                                private _after = count magazines _firer;
-                                if (_after >= _ammoBefore) then {
-                                    private _w = weapon _firer;
-                                    if (_w != "") then {
-                                        _veh forceWeaponFire [_w, "burst"];
-                                        diag_log format ["SPECTRE ATTACK FORCED FIRE [%1] -> %2 (%3)", _unitId, _roe, _w];
-                                    } else {
-                                        diag_log format ["SPECTRE ATTACK FAIL: no weapon on %1", _unitId];
-                                    };
-                                } else {
-                                    diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2", _unitId, _roe];
-                                };
-                            };
-                        };
-                        _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
-                        diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
-                    } else {
-                        diag_log format ["SPECTRE ATTACK FAIL: no gunner on %1", _unitId];
-                    };
-                } else {
+                if (isNull _target) then {
                     diag_log format ["SPECTRE ATTACK FAIL: target=%1 not found (no position fallback)", _roe];
+                } else {
+                    private _veh = vehicle _unit;
+                    if (_veh != _unit) then {
+                        private _g = gunner _veh;
+                        if (!isNull _g) then {
+                            _g doTarget _target;
+                            _g doFire _target;
+                        } else {
+                            _unit doTarget _target;
+                            _unit doFire _target;
+                        };
+                    } else {
+                        _unit doTarget _target;
+                        _unit doFire _target;
+                    };
+                    _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
+                    diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
                 };
             };
         };
