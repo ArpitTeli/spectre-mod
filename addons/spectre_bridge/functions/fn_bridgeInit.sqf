@@ -244,26 +244,32 @@ SPECTRE_fnc_artilleryStrike = {
 
 // ─── Manual flight for AI-less FPV drones (D37 mod strips the pilot turret) ──
 // The D37 FPV config empties class Turrets and sets hasGunner = 0, so the
-// drone has no AI pilot and doMove/flyInHeight are no-ops. Steer it directly
-// with setVelocity instead. Runs on real time (diag_tickTime + uiSleep).
+// drone has no AI pilot and doMove/flyInHeight are no-ops. setVelocity alone
+// bobs it against the ground physics (it pops up a few metres and vibrates).
+// Instead: force the engine on, lift it clear of the ground, then step it
+// toward the target with setPosATL (reliable regardless of AI/physics).
+// Runs on real time (diag_tickTime + uiSleep).
 SPECTRE_fnc_fpvFlyTo = {
-    params ["_drone", "_pos", ["_speed", 45], ["_timeout", 120], ["_alt", 50]];
+    params ["_drone", "_pos", ["_speed", 40], ["_timeout", 120], ["_alt", 50]];
     private _end = diag_tickTime + _timeout;
+    _drone engineOn true;
+    private _start = getPosATL _drone;
+    _drone setPosATL [_start select 0, _start select 1, 10];
     while { alive _drone && diag_tickTime < _end } do {
         private _dpos = getPosATL _drone;
-        if (_dpos distance2D _pos < 15) exitWith {};
-        private _dirVec = [_pos select 0, _pos select 1, 0] vectorDiff [_dpos select 0, _dpos select 1, 0];
-        private _len = vectorMagnitude _dirVec;
-        if (_len < 0.1) exitWith {};
-        _dirVec = _dirVec vectorMultiply (1 / _len);
+        private _dx = (_pos select 0) - (_dpos select 0);
+        private _dy = (_pos select 1) - (_dpos select 1);
+        private _dist = sqrt ((_dx * _dx) + (_dy * _dy));
+        if (_dist < 8) exitWith {};
+        private _step = _speed * 0.2;
+        private _nx = (_dpos select 0) + (_dx / _dist) * _step;
+        private _ny = (_dpos select 1) + (_dy / _dist) * _step;
         private _targetAlt = if (count _pos > 2 && { (_pos select 2) > 1 }) then { _pos select 2 } else { _alt };
-        private _vz = ((_targetAlt - (_dpos select 2)) * 0.6) max -12;
-        _drone setVelocity [(_dirVec select 0) * _speed, (_dirVec select 1) * _speed, _vz];
-        _drone setVectorDirAndUp [[_dirVec select 0, _dirVec select 1, 0], [0, 0, 1]];
-        _drone flyInHeight 0; // keep the (absent) engine AI from interfering
+        _drone setPosATL [_nx, _ny, _targetAlt];
+        _drone setVelocity [0, 0, 0];
+        _drone setDir ((_dx atan2 _dy) mod 360);
         uiSleep 0.2;
     };
-    _drone setVelocity [0, 0, -5];
 };
 
 // ─── Command executor ─────────────────────────────────────────────────────────
@@ -301,11 +307,14 @@ SPECTRE_fnc_execCmd = {
                 private _vtype = [_drone] call SPECTRE_fnc_vehicleType;
                 if (_vtype == "FPV") then {
                     // D37 FPVs have no AI pilot (Turrets stripped) — steer the
-                    // drone manually with setVelocity: 50m terrain-following
-                    // approach, then a dive when close to the target.
+                    // drone manually with setPosATL stepping: 50m approach,
+                    // then a dive when close, then detonate.
                     [_drone, _target] spawn {
                         params ["_drone", "_target"];
                         private _timeout = diag_tickTime + 60;
+                        _drone engineOn true;
+                        private _s = getPosATL _drone;
+                        _drone setPosATL [_s select 0, _s select 1, 10];
                         diag_log format ["SPECTRE KAMIKAZE FPV chase start: drone=%1 target=%2", _drone, _target];
                         private _lastPos = getPosATL _target;
                         while {alive _drone && diag_tickTime < _timeout} do {
@@ -314,25 +323,27 @@ SPECTRE_fnc_execCmd = {
                             if (alive _target) then { _lastPos = getPosATL _target; };
                             private _tpos = _lastPos;
                             private _dpos = getPosATL _drone;
-                            private _dist = _dpos distance2D _tpos;
-                            private _dirVec = [_tpos select 0, _tpos select 1, 0] vectorDiff [_dpos select 0, _dpos select 1, 0];
-                            private _len = vectorMagnitude _dirVec;
-                            if (_len < 0.1) exitWith {};
-                            _dirVec = _dirVec vectorMultiply (1 / _len);
-                            private _speed = 60;
-                            // Dive profile: descend once close, otherwise hold 50m AGL
-                            private _targetAlt = if (_dist < 150) then { _tpos select 2 } else { 50 };
-                            private _vz = ((_targetAlt - (_dpos select 2)) * 0.8) max -25;
-                            _drone setVelocity [(_dirVec select 0) * _speed, (_dirVec select 1) * _speed, _vz];
-                            _drone setVectorDirAndUp [[_dirVec select 0, _dirVec select 1, 0], [0, 0, 1]];
-                            _drone flyInHeight 0;
-                            // Detonate on impact proximity
-                            if (_dist < 10 && { (_dpos select 2) - (_tpos select 2) < 8 }) then {
+                            private _dx = (_tpos select 0) - (_dpos select 0);
+                            private _dy = (_tpos select 1) - (_dpos select 1);
+                            private _dist = sqrt ((_dx * _dx) + (_dy * _dy));
+                            if (_dist < 6) then {
+                                // Detonate on impact proximity
                                 private _shell = _drone getVariable ["attachedShell", objNull];
                                 if (!isNull _shell) then { triggerAmmo _shell; };
                                 _drone setDamage 1;
+                                uiSleep 0.1;
+                            } else {
+                                private _speed = 60;
+                                private _step = _speed * 0.2;
+                                private _nx = (_dpos select 0) + (_dx / _dist) * _step;
+                                private _ny = (_dpos select 1) + (_dy / _dist) * _step;
+                                // Dive profile: descend once close, otherwise hold 50m AGL
+                                private _targetAlt = if (_dist < 150) then { _tpos select 2 } else { 50 };
+                                _drone setPosATL [_nx, _ny, _targetAlt];
+                                _drone setVelocity [0, 0, 0];
+                                _drone setDir ((_dx atan2 _dy) mod 360);
+                                uiSleep 0.2;
                             };
-                            uiSleep 0.2;
                         };
                         diag_log format ["SPECTRE KAMIKAZE chase end: droneAlive=%1 targetAlive=%2", alive _drone, alive _target];
                     };
