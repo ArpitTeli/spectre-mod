@@ -284,12 +284,26 @@ SPECTRE_fnc_execCmd = {
 
         case "KAMIKAZE": {
             private _drone = _unit;
-            // Resolve target: contact map first (HOSTILE-N), then missionNamespace
+            // Resolve target: contact map first (HOSTILE-N), then missionNamespace,
+            // then fall back to a marker at the contact's last-known position
+            // (sent by the app in _waypoints as [[x,y]]).
             private _target = SPECTRE_contactMap getOrDefault [_roe, objNull];
             if (isNull _target) then {
                 _target = missionNamespace getVariable [_roe, objNull];
             };
-            if (!isNull _drone && !isNull _target) then {
+            if (isNull _target && count _waypoints > 0) then {
+                private _wp = _waypoints select 0;
+                if (count _wp >= 2) then {
+                    _target = "Sign_Arrow_Red_F" createVehicle [_wp select 0, _wp select 1, 0];
+                };
+            };
+            if (isNull _drone) exitWith {
+                diag_log format ["SPECTRE KAMIKAZE FAIL: drone=%1 not found", _unitId];
+            };
+            if (isNull _target) exitWith {
+                diag_log format ["SPECTRE KAMIKAZE FAIL: target=%1 not found (no position fallback)", _roe];
+            };
+            if (true) then {
                 private _vtype = [_drone] call SPECTRE_fnc_vehicleType;
                 if (_vtype == "FPV") then {
                     // D37 FPVs have no AI pilot (Turrets stripped) — steer the
@@ -299,8 +313,12 @@ SPECTRE_fnc_execCmd = {
                         params ["_drone", "_target"];
                         private _timeout = diag_tickTime + 60;
                         diag_log format ["SPECTRE KAMIKAZE FPV chase start: drone=%1 target=%2", _drone, _target];
-                        while {alive _drone && alive _target && diag_tickTime < _timeout} do {
-                            private _tpos = getPosATL _target;
+                        private _lastPos = getPosATL _target;
+                        while {alive _drone && diag_tickTime < _timeout} do {
+                            // Keep chasing the last-known position even if the
+                            // target dies mid-chase.
+                            if (alive _target) then { _lastPos = getPosATL _target; };
+                            private _tpos = _lastPos;
                             private _dpos = getPosATL _drone;
                             private _dist = _dpos distance2D _tpos;
                             private _dirVec = [_tpos select 0, _tpos select 1, 0] vectorDiff [_dpos select 0, _dpos select 1, 0];
@@ -581,29 +599,52 @@ SPECTRE_fnc_execCmd = {
 
         case "ATTACK": {
             if (!isNull _unit) then {
-                // Resolve target: contact map first (HOSTILE-N), then missionNamespace
+                // Resolve target: contact map first (HOSTILE-N), then missionNamespace,
+                // then fall back to a temporary target at the contact's last-known
+                // position (sent by the app in _waypoints as [[x,y]]).
                 private _target = SPECTRE_contactMap getOrDefault [_roe, objNull];
                 if (isNull _target) then {
                     _target = missionNamespace getVariable [_roe, objNull];
                 };
-                if (!isNull _target) then {
-                    private _veh = vehicle _unit;
-                    if (_veh != _unit) then {
-                        private _g = gunner _veh;
-                        if (!isNull _g) then {
-                            _g doTarget _target;
-                            _g doFire _target;
-                        } else {
-                            _unit doTarget _target;
-                            _unit doFire _target;
-                        };
-                    } else {
-                        _unit doTarget _target;
-                        _unit doFire _target;
+                if (isNull _target && count _waypoints > 0) then {
+                    private _wp = _waypoints select 0;
+                    if (count _wp >= 2) then {
+                        _target = "Sign_Arrow_Red_F" createVehicle [_wp select 0, _wp select 1, 0];
                     };
-                    _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
-                    diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
                 };
+                if (isNull _target) exitWith {
+                    diag_log format ["SPECTRE ATTACK FAIL: target=%1 not found (no position fallback)", _roe];
+                };
+                private _veh = vehicle _unit;
+                private _firer = if (_veh != _unit && { !isNull (gunner _veh) }) then { gunner _veh } else { _unit };
+                if (isNull _firer) exitWith {
+                    diag_log format ["SPECTRE ATTACK FAIL: no gunner on %1", _unitId];
+                };
+                private _ammoBefore = count magazines _firer;
+                _firer doTarget _target;
+                _firer doFire _target;
+                // Fire-verification ladder: if nothing was fired shortly after,
+                // force the weapon (bypasses AI/ROE stalls) and log the outcome.
+                [_firer, _target, _unitId, _roe, _veh, _ammoBefore] spawn {
+                    params ["_firer", "_target", "_unitId", "_roe", "_veh", "_ammoBefore"];
+                    uiSleep 1.5;
+                    if (!isNull _firer && !isNull _target) then {
+                        private _after = count magazines _firer;
+                        if (_after >= _ammoBefore) then {
+                            private _w = weapon _firer;
+                            if (_w != "") then {
+                                _veh forceWeaponFire [_w, "burst"];
+                                diag_log format ["SPECTRE ATTACK FORCED FIRE [%1] -> %2 (%3)", _unitId, _roe, _w];
+                            } else {
+                                diag_log format ["SPECTRE ATTACK FAIL: no weapon on %1", _unitId];
+                            };
+                        } else {
+                            diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2", _unitId, _roe];
+                        };
+                    };
+                };
+                _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
+                diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
             };
         };
 
@@ -858,17 +899,26 @@ SPECTRE_fnc_broadcastState = {
     private _allEnemies = _enemyInfantry + _enemyVehicles;
     _allEnemies = _allEnemies arrayIntersect _allEnemies;
     // Rebuild the contact-ID -> object map so ATTACK/KAMIKAZE can resolve targets.
+    // IDs are PERSISTENT per enemy object: an enemy keeps its HOSTILE-N id for
+    // its whole life, so ids never shift when the enemy set changes — the app
+    // can always resolve the exact target it shows on the map. (Previously the
+    // ids were renumbered every 0.5s broadcast, so ATTACK/KAMIKAZE silently
+    // missed: the target id the app sent had already moved or vanished.)
     SPECTRE_contactMap = createHashMap;
     {
         private _e = _x;
         if (!isNull _e) then {
-            private _cid = format ["HOSTILE-%1", _ci];
+            private _cid = _e getVariable ["SPECTRE_cid", ""];
+            if (_cid == "") then {
+                _cid = format ["HOSTILE-%1", _ci];
+                _e setVariable ["SPECTRE_cid", _cid];
+                _ci = _ci + 1;
+            };
             SPECTRE_contactMap set [_cid, _e];
             private _contactJson = [_e, _cid] call SPECTRE_fnc_serializeContact;
             if (_contactJson != "") then {
                 diag_log format ["SPECTRE_CONTACT:%1", _contactJson];
             };
-            _ci = _ci + 1;
         };
     } forEach _allEnemies;
 
@@ -880,14 +930,13 @@ SPECTRE_fnc_broadcastState = {
 };
 
 // ─── Command reader ───────────────────────────────────────────────────────────
-// Parses the command file content and executes via execCmd.
-// No call compile on the whole file — direct parsing + function call.
-// Idempotent by design: every poll re-parses ALL lines and per-command-id
-// dedup skips already-executed ones. There is NO whole-file dedup: a missed or
-// partially-read poll can never wedge the reader, because the next poll simply
-// re-reads the file and executes whatever is new.
+// Consume-once protocol: READ_CLEAR returns the file content AND truncates the
+// file, so every command exists exactly once and is executed exactly once.
+// No whole-file/banner state to desync — a command can never be silently lost
+// or duplicated. The app only writes when the file is empty (write-if-empty)
+// and re-sends unacked commands with fresh ids as a failsafe.
 SPECTRE_fnc_readCommands = {
-    private _result = "spectre_ext" callExtension ["READ", ["addons\spectre_cmds.sqf"]];
+    private _result = "spectre_ext" callExtension ["READ_CLEAR", ["addons\spectre_cmds.sqf"]];
     // Robust: DLL may return ["content"] (array) or "content" (string)
     private _sqf = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
     if (isNil "_sqf" || { _sqf isEqualTo "" }) exitWith {};
@@ -897,21 +946,6 @@ SPECTRE_fnc_readCommands = {
     };
     if (_dllErr) exitWith {};
 
-    // Session banner: the app prefixes every write with "// session=<epochms>".
-    // When the banner changes (app restarted / new Arma session cleared the
-    // file), forget all previously-executed ids so the new session's commands
-    // are not mistaken for old ones.
-    private _banner = _sqf splitString (toString [13, 10]) select 0;
-    if (!isNil "_banner" && { count _banner > 11 && { _banner select [0, 11] == "// session=" } }) then {
-        if (_banner != SPECTRE_lastBanner) then {
-            SPECTRE_lastBanner = _banner;
-            SPECTRE_execCmdIds = [];
-        };
-    };
-
-    // The file holds MANY commands, one per line, each ending in
-    //   ... call SPECTRE_fnc_execCmd;
-    // Split on CR and LF (drops blank lines), then run every command line.
     private _lines = _sqf splitString (toString [13, 10]);
     private _ran = 0;
 
@@ -928,7 +962,9 @@ SPECTRE_fnc_readCommands = {
                 private _args = call compile _argsStr;
                 if (!isNil "_args" && { typeName _args == "ARRAY" } && { count _args > 0 }) then {
                     private _cmdId = _args select 0;
-                    // Skip commands we've already executed (per-id dedup).
+                    // Safety-net dedup: the file is consumed after each read,
+                    // but the app's force-overwrite failsafe can re-write an
+                    // unacked command, so skip anything already executed.
                     if !(_cmdId in SPECTRE_execCmdIds) then {
                         SPECTRE_execCmdIds pushBack _cmdId;
                         _args call SPECTRE_fnc_execCmd;
@@ -942,9 +978,9 @@ SPECTRE_fnc_readCommands = {
         };
     } forEach _lines;
 
-    // Keep the executed-id list bounded (the file is capped to the last 50 cmds).
-    if (count SPECTRE_execCmdIds > 200) then {
-        SPECTRE_execCmdIds = SPECTRE_execCmdIds select [(count SPECTRE_execCmdIds) - 100];
+    // Keep the executed-id list bounded.
+    if (count SPECTRE_execCmdIds > 400) then {
+        SPECTRE_execCmdIds = SPECTRE_execCmdIds select [(count SPECTRE_execCmdIds) - 200];
     };
 
     if (_ran > 0) then {
@@ -956,7 +992,6 @@ SPECTRE_fnc_readCommands = {
 hint "SPECTRE C2 Bridge: ACTIVE";
 diag_log "SPECTRE: Bridge running (wall-clock mode). Broadcasting every 0.5s, reading commands every 0.3s.";
 SPECTRE_initialized = true;
-SPECTRE_lastBanner = "";
 SPECTRE_execCmdIds = [];
 
 [] spawn {
