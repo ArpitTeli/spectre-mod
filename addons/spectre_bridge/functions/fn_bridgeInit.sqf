@@ -923,7 +923,12 @@ SPECTRE_fnc_broadcastState = {
 // or duplicated. The app only writes when the file is empty (write-if-empty)
 // and re-sends unacked commands with fresh ids as a failsafe.
 SPECTRE_fnc_readCommands = {
-    private _result = "spectre_ext" callExtension ["READ_CLEAR", ["addons\spectre_cmds.sqf"]];
+    // Unique args on every call: the DLL uses args[0] (the path) and ignores
+    // args[1], but the VARYING nonce means Arma can never constant-fold or
+    // cache the callExtension result — we always get the CURRENT file content
+    // instead of the first read repeated forever (the root cause of commands
+    // silently stopping after the first ones).
+    private _result = "spectre_ext" callExtension ["READ_CLEAR", ["addons\spectre_cmds.sqf", str diag_tickTime]];
     // Robust: DLL may return ["content"] (array) or "content" (string)
     private _sqf = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
     if (isNil "_sqf" || { _sqf isEqualTo "" }) exitWith {};
