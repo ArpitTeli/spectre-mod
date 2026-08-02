@@ -621,14 +621,9 @@ SPECTRE_fnc_execCmd = {
                         _g doTarget _target;
                         _g doFire _target;
                         // Force fire: bypasses ROE/weapons-safe stalls that block
-                        // AI doFire. Commanding the vehicle's weapon directly.
-                        private _w = weapon _g;
-                        if (_w != "") then {
-                            _veh forceWeaponFire [_w, "burst"];
-                            diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2 (%3)", _unitId, _roe, _w];
-                        } else {
-                            diag_log format ["SPECTRE ATTACK FAIL: no weapon on gunner %1", _unitId];
-                        };
+                        // AI doFire. fireAtTarget fires the main gun directly.
+                        _veh fireAtTarget [_target, "mainGun"];
+                        diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2", _unitId, _roe];
                     } else {
                         _unit doTarget _target;
                         _unit doFire _target;
