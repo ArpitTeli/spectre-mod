@@ -917,70 +917,55 @@ SPECTRE_fnc_broadcastState = {
 };
 
 // ─── Command reader ───────────────────────────────────────────────────────────
-// Consume-once protocol: READ_CLEAR returns the file content AND truncates the
-// file, so every command exists exactly once and is executed exactly once.
-// No whole-file/banner state to desync — a command can never be silently lost
-// or duplicated. The app only writes when the file is empty (write-if-empty)
-// and re-sends unacked commands with fresh ids as a failsafe.
+// Plain-text consume-once protocol. The app writes ONE command per file in a
+// simple pipe-delimited format:
+//   <id>|<TYPE>|<unitId>|<x1,y1;x2,y2...>|<roe>|<action>
+// The reader splits the single line and dispatches directly to execCmd.
+// Deliberately avoids `call compile`, a per-id dedup list, and multi-line
+// forEach parsing — those constructs are the ones that proved unreliable in
+// this environment. The file is consumed (READ_CLEAR) so a command exists
+// exactly once. Unique args on every call prevent Arma from caching the
+// callExtension result.
 SPECTRE_fnc_readCommands = {
-    // Unique args on every call: the DLL uses args[0] (the path) and ignores
-    // args[1], but the VARYING nonce means Arma can never constant-fold or
-    // cache the callExtension result — we always get the CURRENT file content
-    // instead of the first read repeated forever (the root cause of commands
-    // silently stopping after the first ones).
     private _result = "spectre_ext" callExtension ["READ_CLEAR", ["addons\spectre_cmds.sqf", str diag_tickTime]];
-    // Robust: DLL may return ["content"] (array) or "content" (string)
-    private _sqf = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
-    if (isNil "_sqf" || { _sqf isEqualTo "" }) exitWith {};
-    private _dllErr = _sqf find "ERR_" == 0;
-    if (_dllErr) then {
-        diag_log format ["SPECTRE readCommands DLL error: %1", _sqf];
+    private _content = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
+    if (isNil "_content" || { _content isEqualTo "" }) exitWith {};
+    if (_content find "ERR_" == 0) exitWith {
+        diag_log format ["SPECTRE readCommands DLL error: %1", _content];
     };
-    if (_dllErr) exitWith {};
-
-    private _lines = _sqf splitString (toString [13, 10]);
-    private _ran = 0;
-    // Read diagnostics: log every non-empty read so the app-side can see
-    // exactly what Arma's callExtension returned (bytes/lines/new executed).
-    diag_log format ["SPECTRE read: bytes=%1 lines=%2", count _sqf, count _lines];
-
-    {
-        private _line = _x;
-        private _callIdx = _line find " call SPECTRE_fnc_execCmd;";
-        if (_callIdx >= 0) then {
-            private _argsStr = _line select [0, _callIdx];
-            // Trim leading whitespace so indented lines still parse.
-            while { count _argsStr > 0 && { (_argsStr select [0, 1]) in [" ", toString [9]] } } do {
-                _argsStr = _argsStr select [1];
-            };
-            if (count _argsStr > 0 && { _argsStr select [0, 1] == "[" }) then {
-                private _args = call compile _argsStr;
-                if (!isNil "_args" && { typeName _args == "ARRAY" } && { count _args > 0 }) then {
-                    private _cmdId = _args select 0;
-                    // Safety-net dedup: the file is consumed after each read,
-                    // but the app's force-overwrite failsafe can re-write an
-                    // unacked command, so skip anything already executed.
-                    if !(_cmdId in SPECTRE_execCmdIds) then {
-                        SPECTRE_execCmdIds pushBack _cmdId;
-                        _args call SPECTRE_fnc_execCmd;
-                        _ran = _ran + 1;
-                        diag_log format ["SPECTRE: Executed OK: %1", _argsStr select [0, 50]];
-                    };
-                } else {
-                    diag_log format ["SPECTRE: Bad args: %1", _argsStr];
-                };
-            };
+    // Strip leading comment lines (session banner / mission-restart comment).
+    private _stripped = false;
+    while { !_stripped } do {
+        if (_content select [0, 2] == "//") then {
+            private _nl = _content find (toString [10]);
+            if (_nl < 0) then { _content = ""; _stripped = true; }
+            else { _content = _content select [_nl + 1]; };
+        } else {
+            _stripped = true;
         };
-    } forEach _lines;
+    };
+    if (_content isEqualTo "") exitWith {};
 
-    // Keep the executed-id list bounded.
-    if (count SPECTRE_execCmdIds > 400) then {
-        SPECTRE_execCmdIds = SPECTRE_execCmdIds select [(count SPECTRE_execCmdIds) - 200];
+    private _parts = _content splitString "|";
+    if (count _parts < 3) exitWith {
+        diag_log format ["SPECTRE read: malformed command [%1]", _content select [0, 60]];
     };
 
-    if (_ran > 0) then {
-        diag_log format ["SPECTRE: CMD batch ran %1 new command(s)", _ran];
-    };
+    private _id     = parseNumber (_parts select 0);
+    private _type   = _parts select 1;
+    private _uid    = _parts select 2;
+    private _wps    = [];
+    {
+        private _xy = _x splitString ",";
+        if (count _xy >= 2) then {
+            _wps pushBack [parseNumber (_xy select 0), parseNumber (_xy select 1)];
+        };
+    } forEach ((_parts select 3) splitString ";");
+    private _roe    = if (count _parts > 4) then { _parts select 4 } else { "" };
+    private _action = if (count _parts > 5) then { _parts select 5 } else { "" };
+
+    [_id, _type, _uid, _wps, _roe, _action] call SPECTRE_fnc_execCmd;
+    diag_log format ["SPECTRE: Executed OK: %1|%2|%3", _id, _type, _uid];
 };
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
