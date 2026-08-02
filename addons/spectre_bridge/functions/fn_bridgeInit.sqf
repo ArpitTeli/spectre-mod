@@ -242,6 +242,30 @@ SPECTRE_fnc_artilleryStrike = {
     diag_log format ["SPECTRE: Artillery %1x %2 fired at %3", _rounds, _ammoType, _targetPos];
 };
 
+// ─── Manual flight for AI-less FPV drones (D37 mod strips the pilot turret) ──
+// The D37 FPV config empties class Turrets and sets hasGunner = 0, so the
+// drone has no AI pilot and doMove/flyInHeight are no-ops. Steer it directly
+// with setVelocity instead. Runs on real time (diag_tickTime + uiSleep).
+SPECTRE_fnc_fpvFlyTo = {
+    params ["_drone", "_pos", ["_speed", 45], ["_timeout", 120], ["_alt", 50]];
+    private _end = diag_tickTime + _timeout;
+    while { alive _drone && diag_tickTime < _end } do {
+        private _dpos = getPosATL _drone;
+        if (_dpos distance2D _pos < 15) exitWith {};
+        private _dirVec = [_pos select 0, _pos select 1, 0] vectorDiff [_dpos select 0, _dpos select 1, 0];
+        private _len = vectorMagnitude _dirVec;
+        if (_len < 0.1) exitWith {};
+        _dirVec = _dirVec vectorMultiply (1 / _len);
+        private _targetAlt = if (count _pos > 2 && { (_pos select 2) > 1 }) then { _pos select 2 } else { _alt };
+        private _vz = ((_targetAlt - (_dpos select 2)) * 0.6) max -12;
+        _drone setVelocity [(_dirVec select 0) * _speed, (_dirVec select 1) * _speed, _vz];
+        _drone setVectorDirAndUp [[_dirVec select 0, _dirVec select 1, 0], [0, 0, 1]];
+        _drone flyInHeight 0; // keep the (absent) engine AI from interfering
+        uiSleep 0.2;
+    };
+    _drone setVelocity [0, 0, -5];
+};
+
 // ─── Command executor ─────────────────────────────────────────────────────────
 SPECTRE_fnc_execCmd = {
     params [
@@ -266,49 +290,85 @@ SPECTRE_fnc_execCmd = {
                 _target = missionNamespace getVariable [_roe, objNull];
             };
             if (!isNull _drone && !isNull _target) then {
-                if (count _waypoints > 1) then {
-                    // Multi-waypoint terrain-following flight profile
-                    [_drone, _target, _waypoints] spawn {
-                        params ["_drone", "_target", "_wps"];
-                        // UAVs need a fly height to leave the ground
-                        _drone flyInHeight 50;
-                        private _wpIdx = 0;
-                        while {alive _drone && alive _target && _wpIdx < count _wps} do {
-                            private _wp = _wps select _wpIdx;
-                            private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
-                            private _pos = [_wp select 0, _wp select 1, _alt];
-                            _drone doMove _pos;
-                            _drone flyInHeight _alt;
-                            // Wait until drone is within 40m of waypoint or dead.
-                            // diag_tickTime + uiSleep are real-time: the chase
-                            // keeps running even when Arma is backgrounded and
-                            // the simulation is throttled.
-                            private _timeout = diag_tickTime + 30;
-                            while {alive _drone && (_drone distance _pos) >= 40 && diag_tickTime < _timeout} do {
-                                uiSleep 0.2;
-                            };
-                            _wpIdx = _wpIdx + 1;
-                        };
-                        // Final phase: ensure drone is heading to target ground position
-                        if (alive _drone && alive _target) then {
-                            _drone flyInHeight 0;
-                            _drone doMove (getPos _target);
-                        };
-                    };
-                } else {
-                    // Simple direct approach (fallback) — 60s real-time timeout
+                private _vtype = [_drone] call SPECTRE_fnc_vehicleType;
+                if (_vtype == "FPV") then {
+                    // D37 FPVs have no AI pilot (Turrets stripped) — steer the
+                    // drone manually with setVelocity: 50m terrain-following
+                    // approach, then a dive when close to the target.
                     [_drone, _target] spawn {
                         params ["_drone", "_target"];
                         private _timeout = diag_tickTime + 60;
-                        // UAVs need a fly height to leave the ground
-                        _drone flyInHeight 50;
-                        diag_log format ["SPECTRE KAMIKAZE chase start: drone=%1 target=%2", _drone, _target];
+                        diag_log format ["SPECTRE KAMIKAZE FPV chase start: drone=%1 target=%2", _drone, _target];
                         while {alive _drone && alive _target && diag_tickTime < _timeout} do {
-                            _drone doMove (getPos _target);
-                            _drone flyInHeight 50;
-                            uiSleep 0.5;
+                            private _tpos = getPosATL _target;
+                            private _dpos = getPosATL _drone;
+                            private _dist = _dpos distance2D _tpos;
+                            private _dirVec = [_tpos select 0, _tpos select 1, 0] vectorDiff [_dpos select 0, _dpos select 1, 0];
+                            private _len = vectorMagnitude _dirVec;
+                            if (_len < 0.1) exitWith {};
+                            _dirVec = _dirVec vectorMultiply (1 / _len);
+                            private _speed = 60;
+                            // Dive profile: descend once close, otherwise hold 50m AGL
+                            private _targetAlt = if (_dist < 150) then { _tpos select 2 } else { 50 };
+                            private _vz = ((_targetAlt - (_dpos select 2)) * 0.8) max -25;
+                            _drone setVelocity [(_dirVec select 0) * _speed, (_dirVec select 1) * _speed, _vz];
+                            _drone setVectorDirAndUp [[_dirVec select 0, _dirVec select 1, 0], [0, 0, 1]];
+                            _drone flyInHeight 0;
+                            // Detonate on impact proximity
+                            if (_dist < 10 && { (_dpos select 2) - (_tpos select 2) < 8 }) then {
+                                private _shell = _drone getVariable ["attachedShell", objNull];
+                                if (!isNull _shell) then { triggerAmmo _shell; };
+                                _drone setDamage 1;
+                            };
+                            uiSleep 0.2;
                         };
                         diag_log format ["SPECTRE KAMIKAZE chase end: droneAlive=%1 targetAlive=%2", alive _drone, alive _target];
+                    };
+                } else {
+                    if (count _waypoints > 1) then {
+                        // Multi-waypoint terrain-following flight profile
+                        [_drone, _target, _waypoints] spawn {
+                            params ["_drone", "_target", "_wps"];
+                            // UAVs need a fly height to leave the ground
+                            _drone flyInHeight 50;
+                            private _wpIdx = 0;
+                            while {alive _drone && alive _target && _wpIdx < count _wps} do {
+                                private _wp = _wps select _wpIdx;
+                                private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
+                                private _pos = [_wp select 0, _wp select 1, _alt];
+                                _drone doMove _pos;
+                                _drone flyInHeight _alt;
+                                // Wait until drone is within 40m of waypoint or dead.
+                                // diag_tickTime + uiSleep are real-time: the chase
+                                // keeps running even when Arma is backgrounded and
+                                // the simulation is throttled.
+                                private _timeout = diag_tickTime + 30;
+                                while {alive _drone && (_drone distance _pos) >= 40 && diag_tickTime < _timeout} do {
+                                    uiSleep 0.2;
+                                };
+                                _wpIdx = _wpIdx + 1;
+                            };
+                            // Final phase: ensure drone is heading to target ground position
+                            if (alive _drone && alive _target) then {
+                                _drone flyInHeight 0;
+                                _drone doMove (getPos _target);
+                            };
+                        };
+                    } else {
+                        // Simple direct approach (fallback) — 60s real-time timeout
+                        [_drone, _target] spawn {
+                            params ["_drone", "_target"];
+                            private _timeout = diag_tickTime + 60;
+                            // UAVs need a fly height to leave the ground
+                            _drone flyInHeight 50;
+                            diag_log format ["SPECTRE KAMIKAZE chase start: drone=%1 target=%2", _drone, _target];
+                            while {alive _drone && alive _target && diag_tickTime < _timeout} do {
+                                _drone doMove (getPos _target);
+                                _drone flyInHeight 50;
+                                uiSleep 0.5;
+                            };
+                            diag_log format ["SPECTRE KAMIKAZE chase end: droneAlive=%1 targetAlive=%2", alive _drone, alive _target];
+                        };
                     };
                 };
                 _drone setVariable ["SPECTRE_currentOrder", "KAMIKAZE", false];
@@ -434,6 +494,7 @@ SPECTRE_fnc_execCmd = {
             if (!isNull _unit && count _waypoints > 0) then {
                 private _veh = vehicle _unit;
                 private _grp = group _unit;
+                private _vtype = [_veh] call SPECTRE_fnc_vehicleType;
 
                 // Parse speed from _action param (format: "speed:120")
                 private _speedStr = _action;
@@ -468,21 +529,49 @@ SPECTRE_fnc_execCmd = {
                         };
                     } forEach _waypoints;
 
+                    // FPV drones ignore group waypoints (no AI pilot) — fly them manually.
+                    if (_vtype == "FPV") then {
+                        [_veh, _waypoints, 45, 120, 50] spawn {
+                            params ["_veh", "_wps", "_speed", "_timeout", "_alt"];
+                            private _end = diag_tickTime + _timeout;
+                            private _wpIdx = 0;
+                            while { alive _veh && diag_tickTime < _end && _wpIdx < count _wps } do {
+                                private _wp = _wps select _wpIdx;
+                                private _wpAlt = if (count _wp > 2) then { _wp select 2 } else { _alt };
+                                private _pos = [_wp select 0, _wp select 1, _wpAlt];
+                                [_veh, _pos, _speed, 30, _wpAlt] call SPECTRE_fnc_fpvFlyTo;
+                                _wpIdx = _wpIdx + 1;
+                            };
+                        };
+                    };
+
                     _unit setVariable ["SPECTRE_currentOrder", "MOVE TO (MULTI)", false];
                     diag_log format ["SPECTRE MOVE_TO [%1]: %2 waypoints, speed %3", _unitId, count _waypoints, _spd];
                 } else {
-                    // Single waypoint: direct doMove
+                    // Single waypoint: direct move
                     private _wp = _waypoints select 0;
                     private _pos = [_wp select 0, _wp select 1, 0];
-                    if (_veh != _unit) then {
-                        private _d = driver _veh;
-                        if (!isNull _d) then {
-                            _d doMove _pos;
-                        } else {
-                            _unit doMove _pos;
-                        };
+                    if (_vtype == "FPV") then {
+                        // No AI pilot on D37 FPVs — manual flight.
+                        [_veh, _pos, 45, 120, 50] spawn SPECTRE_fnc_fpvFlyTo;
                     } else {
-                        _unit doMove _pos;
+                        if (_veh isKindOf "Air") then {
+                            // UAVs/helis must be commanded at vehicle level; the
+                            // driver is a dummy unit that ignores doMove.
+                            _veh doMove _pos;
+                            _veh flyInHeight 50;
+                        } else {
+                            if (_veh != _unit) then {
+                                private _d = driver _veh;
+                                if (!isNull _d) then {
+                                    _d doMove _pos;
+                                } else {
+                                    _unit doMove _pos;
+                                };
+                            } else {
+                                _unit doMove _pos;
+                            };
+                        };
                     };
                     _unit setVariable ["SPECTRE_currentOrder", "MOVE TO", false];
                     diag_log format ["SPECTRE MOVE_TO [%1]: %2", _unitId, _pos];
@@ -872,7 +961,6 @@ SPECTRE_execCmdIds = [];
 
 [] spawn {
     private _lastBroadcast = -999;
-    private _lastCmdRead   = -999;
     private _lastHint      = -999;
 
     while { true } do {
@@ -899,8 +987,26 @@ SPECTRE_execCmdIds = [];
             };
         };
 
-        if (_t - _lastCmdRead >= SPECTRE_cmdReadRate) then {
-            _lastCmdRead = _t;
+        // uiSleep uses real time, NOT simulation time.
+        // Regular sleep slows to a crawl when Arma is backgrounded.
+        uiSleep 0.1;
+    };
+};
+
+// ─── Command reader loop (independent from the broadcast loop) ────────────────
+// Runs on its own schedule so a stall in either path can never starve the
+// other. Every poll re-reads the whole command file and executes new ids
+// (idempotent by design). A periodic heartbeat makes reader stalls visible
+// in the RPT instead of failing silently.
+[] spawn {
+    private _lastRead  = -999;
+    private _lastBeat  = -999;
+
+    while { true } do {
+        private _t = diag_tickTime;
+
+        if (_t - _lastRead >= SPECTRE_cmdReadRate) then {
+            _lastRead = _t;
             try {
                 call SPECTRE_fnc_readCommands;
             } catch {
@@ -908,8 +1014,12 @@ SPECTRE_execCmdIds = [];
             };
         };
 
-        // uiSleep uses real time, NOT simulation time.
-        // Regular sleep slows to a crawl when Arma is backgrounded.
+        // Heartbeat so a wedged reader is visible in the logs.
+        if (_t - _lastBeat >= 30) then {
+            _lastBeat = _t;
+            diag_log format ["SPECTRE reader beat: cmdIds=%1", count SPECTRE_execCmdIds];
+        };
+
         uiSleep 0.1;
     };
 };
