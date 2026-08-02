@@ -270,20 +270,22 @@ SPECTRE_fnc_execCmd = {
                     // Multi-waypoint terrain-following flight profile
                     [_drone, _target, _waypoints] spawn {
                         params ["_drone", "_target", "_wps"];
-                    // UAVs need a fly height to leave the ground
-                    _drone flyInHeight 50;
-                    private _wpIdx = 0;
-                    while {alive _drone && alive _target && _wpIdx < count _wps} do {
-                        private _wp = _wps select _wpIdx;
-                        private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
-                        private _pos = [_wp select 0, _wp select 1, _alt];
+                        // UAVs need a fly height to leave the ground
+                        _drone flyInHeight 50;
+                        private _wpIdx = 0;
+                        while {alive _drone && alive _target && _wpIdx < count _wps} do {
+                            private _wp = _wps select _wpIdx;
+                            private _alt = if (count _wp > 2) then { _wp select 2 } else { 50 };
+                            private _pos = [_wp select 0, _wp select 1, _alt];
                             _drone doMove _pos;
                             _drone flyInHeight _alt;
-                            // Wait until drone is within 40m of waypoint or dead
-                            private _timeout = time + 30;
-                            waitUntil {
-                                sleep 0.1;
-                                (alive _drone && (_drone distance _pos) < 40) || !alive _drone || time > _timeout
+                            // Wait until drone is within 40m of waypoint or dead.
+                            // diag_tickTime + uiSleep are real-time: the chase
+                            // keeps running even when Arma is backgrounded and
+                            // the simulation is throttled.
+                            private _timeout = diag_tickTime + 30;
+                            while {alive _drone && (_drone distance _pos) >= 40 && diag_tickTime < _timeout} do {
+                                uiSleep 0.2;
                             };
                             _wpIdx = _wpIdx + 1;
                         };
@@ -294,17 +296,17 @@ SPECTRE_fnc_execCmd = {
                         };
                     };
                 } else {
-                    // Simple direct approach (fallback) — 60s timeout
+                    // Simple direct approach (fallback) — 60s real-time timeout
                     [_drone, _target] spawn {
                         params ["_drone", "_target"];
-                        private _timeout = time + 60;
+                        private _timeout = diag_tickTime + 60;
                         // UAVs need a fly height to leave the ground
                         _drone flyInHeight 50;
                         diag_log format ["SPECTRE KAMIKAZE chase start: drone=%1 target=%2", _drone, _target];
-                        while {alive _drone && alive _target && time < _timeout} do {
+                        while {alive _drone && alive _target && diag_tickTime < _timeout} do {
                             _drone doMove (getPos _target);
                             _drone flyInHeight 50;
-                            sleep 0.5;
+                            uiSleep 0.5;
                         };
                         diag_log format ["SPECTRE KAMIKAZE chase end: droneAlive=%1 targetAlive=%2", alive _drone, alive _target];
                     };
@@ -790,21 +792,37 @@ SPECTRE_fnc_broadcastState = {
 
 // ─── Command reader ───────────────────────────────────────────────────────────
 // Parses the command file content and executes via execCmd.
-// No call compile — uses direct parsing + function call.
+// No call compile on the whole file — direct parsing + function call.
+// Idempotent by design: every poll re-parses ALL lines and per-command-id
+// dedup skips already-executed ones. There is NO whole-file dedup: a missed or
+// partially-read poll can never wedge the reader, because the next poll simply
+// re-reads the file and executes whatever is new.
 SPECTRE_fnc_readCommands = {
     private _result = "spectre_ext" callExtension ["READ", ["addons\spectre_cmds.sqf"]];
     // Robust: DLL may return ["content"] (array) or "content" (string)
     private _sqf = if (typeName _result == "ARRAY") then { if (count _result > 0) then { _result select 0 } else { "" } } else { _result };
-    if (isNil "_sqf" || { _sqf isEqualTo "" || { _sqf find "ERR_" == 0 } }) exitWith {};
+    if (isNil "_sqf" || { _sqf isEqualTo "" }) exitWith {};
+    private _dllErr = _sqf find "ERR_" == 0;
+    if (_dllErr) then {
+        diag_log format ["SPECTRE readCommands DLL error: %1", _sqf];
+    };
+    if (_dllErr) exitWith {};
 
-    // Whole-file dedup: skip re-parsing when the file is byte-identical to last read.
-    if (_sqf == SPECTRE_lastSQF) exitWith {};
-    SPECTRE_lastSQF = _sqf;
+    // Session banner: the app prefixes every write with "// session=<epochms>".
+    // When the banner changes (app restarted / new Arma session cleared the
+    // file), forget all previously-executed ids so the new session's commands
+    // are not mistaken for old ones.
+    private _banner = _sqf splitString (toString [13, 10]) select 0;
+    if (!isNil "_banner" && { count _banner > 11 && { _banner select [0, 11] == "// session=" } }) then {
+        if (_banner != SPECTRE_lastBanner) then {
+            SPECTRE_lastBanner = _banner;
+            SPECTRE_execCmdIds = [];
+        };
+    };
 
     // The file holds MANY commands, one per line, each ending in
     //   ... call SPECTRE_fnc_execCmd;
     // Split on CR and LF (drops blank lines), then run every command line.
-    // Per-command-id dedup means new lines run even if earlier lines are unchanged.
     private _lines = _sqf splitString (toString [13, 10]);
     private _ran = 0;
 
@@ -849,7 +867,7 @@ SPECTRE_fnc_readCommands = {
 hint "SPECTRE C2 Bridge: ACTIVE";
 diag_log "SPECTRE: Bridge running (wall-clock mode). Broadcasting every 0.5s, reading commands every 0.3s.";
 SPECTRE_initialized = true;
-SPECTRE_lastSQF = "";
+SPECTRE_lastBanner = "";
 SPECTRE_execCmdIds = [];
 
 [] spawn {
