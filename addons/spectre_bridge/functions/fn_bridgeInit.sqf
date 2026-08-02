@@ -616,18 +616,23 @@ SPECTRE_fnc_execCmd = {
                     diag_log format ["SPECTRE ATTACK FAIL: target=%1 not found (no position fallback)", _roe];
                 } else {
                     private _veh = vehicle _unit;
-                    if (_veh != _unit) then {
-                        private _g = gunner _veh;
-                        if (!isNull _g) then {
-                            _g doTarget _target;
-                            _g doFire _target;
+                    private _g = gunner _veh;
+                    if (_veh != _unit && !isNull _g) then {
+                        _g doTarget _target;
+                        _g doFire _target;
+                        // Force fire: bypasses ROE/weapons-safe stalls that block
+                        // AI doFire. Commanding the vehicle's weapon directly.
+                        private _w = weapon _g;
+                        if (_w != "") then {
+                            _veh forceWeaponFire [_w, "burst"];
+                            diag_log format ["SPECTRE ATTACK FIRED [%1] -> %2 (%3)", _unitId, _roe, _w];
                         } else {
-                            _unit doTarget _target;
-                            _unit doFire _target;
+                            diag_log format ["SPECTRE ATTACK FAIL: no weapon on gunner %1", _unitId];
                         };
                     } else {
                         _unit doTarget _target;
                         _unit doFire _target;
+                        diag_log format ["SPECTRE ATTACK FIRED (no gunner, direct) [%1] -> %2", _unitId, _roe];
                     };
                     _unit setVariable ["SPECTRE_currentOrder", "ATTACK", false];
                     diag_log format ["SPECTRE ATTACK [%1] -> %2", _unitId, _roe];
@@ -935,6 +940,9 @@ SPECTRE_fnc_readCommands = {
 
     private _lines = _sqf splitString (toString [13, 10]);
     private _ran = 0;
+    // Read diagnostics: log every non-empty read so the app-side can see
+    // exactly what Arma's callExtension returned (bytes/lines/new executed).
+    diag_log format ["SPECTRE read: bytes=%1 lines=%2", count _sqf, count _lines];
 
     {
         private _line = _x;
