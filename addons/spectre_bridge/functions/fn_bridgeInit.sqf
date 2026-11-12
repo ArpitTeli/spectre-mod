@@ -1,14 +1,15 @@
 /*
   SPECTRE C2 Bridge - Arma 3 PBO Addon v2.3
   ===========================================
-  Auto-executed via CBA XEH PostInit.
+  Auto-started by vanilla CfgFunctions postInit (see config.cpp). CBA is not required.
   No manual init.sqf editing needed — just enable the mod.
 
   HOW IT WORKS:
   Arma -> SPECTRE : diag_log writes to the Arma RPT log file.
-                    SPECTRE tails that log file and parses SPECTRE_STATE: lines.
-  SPECTRE -> Arma : SPECTRE writes "spectre_to_arma.sqf" into the mission folder.
-                    This script reads it with loadFile + call compile every 0.75s.
+                    SPECTRE tails that log file and parses SPECTRE_META/UNIT/CONTACT/EVENTS lines.
+  SPECTRE -> Arma : SPECTRE writes one command at a time to @SPECTRE/addons/spectre_cmds.sqf.
+                    This script reads and clears it through the spectre_ext DLL (READ_CLEAR)
+                    every 0.3s. Format: id|TYPE|unitId|x,y;x,y|roe|action
 */
 
 // ─── Rate config (globals — spawn block can't see private locals) ─────────────
